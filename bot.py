@@ -29,24 +29,19 @@ except ImportError:
 # ============================ EDIT THIS SECTION =============================
 
 SEARCH_QUERIES = [
-    "Python backend developer remote worldwide",
-    "Django FastAPI remote international",
     "full stack developer Python React remote",
     "Node.js developer remote worldwide",
 ]
 
 # Skill weights: increase the weight of skills that matter most in your resume.
 TARGET_SKILLS = {
-    "python": 5,
-    "django": 5,
-    "fastapi": 5,
     "node.js": 4,
     "javascript": 3,
     "react": 3,
     "postgresql": 3,
     "rest api": 3,
     "docker": 2,
-    "aws": 2,
+    "aws": 1,
 }
 
 PREFERRED_TERMS = [
@@ -69,7 +64,7 @@ ELIGIBILITY_REVIEW_TERMS = [
     "countries we cannot hire from", "payment restrictions", "us person",
 ]
 
-MIN_MATCH_SCORE = 8
+MIN_MATCH_SCORE = 3
 MAX_JOBS_PER_RUN = 15
 MAX_SEEN_JOBS = 2000
 SEEN_JOBS_FILE = Path("seen_jobs.txt")
