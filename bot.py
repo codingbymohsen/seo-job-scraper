@@ -37,9 +37,7 @@ MAX_JOBS_PER_RUN  = 15     # حداکثر آگهی ارسالی در هر اجر
 
 # ─── کلمات جستجو ──────────────────────────────────────────────────────────────
 SEARCH_QUERIES = [
-    "fullstack developer remote",
-    "nodejs developer remote",
-    "software engineer remote",
+   "fullstack developer worldwide"
 ]
 
 # ─── کلمات ممنوعه (Blacklist) ──────────────────────────────────────────────────
