@@ -1,13 +1,23 @@
-import requests
-import os
+"""Remote job scraper with resume matching and international eligibility review.
+
+Environment variables:
+  Required: RAPIDAPI_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  Optional: GSHEET_CREDENTIALS, GSHEET_ID, TEST_MODE=true
+
+Set TEST_MODE=true to search, score, and print results without sending Telegram
+messages or writing to Google Sheets/seen_jobs.txt.
+"""
+
 import html
 import json
-import time
 import logging
+import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ─── Optional: Google Sheets ──────────────────────────────────────────────────
+import requests
+
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -15,373 +25,248 @@ try:
 except ImportError:
     SHEETS_AVAILABLE = False
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+
+# ============================ EDIT THIS SECTION =============================
+
+SEARCH_QUERIES = [
+    "Python backend developer remote worldwide",
+    "Django FastAPI remote international",
+    "full stack developer Python React remote",
+    "Node.js developer remote worldwide",
+]
+
+# Skill weights: increase the weight of skills that matter most in your resume.
+TARGET_SKILLS = {
+    "python": 5,
+    "django": 5,
+    "fastapi": 5,
+    "node.js": 4,
+    "javascript": 3,
+    "react": 3,
+    "postgresql": 3,
+    "rest api": 3,
+    "docker": 2,
+    "aws": 2,
+}
+
+PREFERRED_TERMS = [
+    "worldwide", "international", "global", "work from anywhere",
+    "remote anywhere", "independent contractor", "contractor",
+]
+
+# These normally indicate the job is not suitable for you.
+HARD_RESTRICTIONS = [
+    "us residents only", "us citizens only",
+    "must reside in the us", "must be located in the us",
+    "must be based in the us", "authorized to work in the united states",
+    "security clearance", "government clearance", "canada only",
+    "uk only", "europe only",
+]
+
+# These are flagged for manual review rather than automatically rejected.
+ELIGIBILITY_REVIEW_TERMS = [
+    "iran", "sanctions", "ofac", "embargo", "restricted countries",
+    "countries we cannot hire from", "payment restrictions", "us person",
+]
+
+MIN_MATCH_SCORE = 8
+MAX_JOBS_PER_RUN = 15
+MAX_SEEN_JOBS = 2000
+SEEN_JOBS_FILE = Path("seen_jobs.txt")
+GSHEET_SHEET_NAME = "Jobs"
+
+# ============================================================================
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-RAPIDAPI_KEY       = os.environ["RAPIDAPI_KEY"]
-TELEGRAM_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
-GSHEET_CREDENTIALS = os.environ.get("GSHEET_CREDENTIALS", "")   # JSON string
-GSHEET_ID          = os.environ.get("GSHEET_ID", "")
-GSHEET_SHEET_NAME  = "Jobs"
-
-SEEN_JOBS_FILE    = Path("seen_jobs.txt")
-MAX_SEEN_JOBS     = 2000   # حداکثر تعداد ID ذخیره شده (جلوگیری از بزرگ شدن فایل)
-MAX_JOBS_PER_RUN  = 15     # حداکثر آگهی ارسالی در هر اجرا
-
-# ─── کلمات جستجو ──────────────────────────────────────────────────────────────
-SEARCH_QUERIES = [
-    "fullstack developer remote",
-    "nodejs developer remote",
-    "software engineer remote",
-]
-
-# ─── کلمات ممنوعه (Blacklist) ──────────────────────────────────────────────────
-BLACKLIST_KEYWORDS = [
-    "us residents only",
-    "must reside in us",
-    "must be located in the us",
-    "must be based in",
-    "director",
-]
-
-# ══════════════════════════════════════════════════════════════════════════════
-# حافظه دائمی — seen_jobs.txt
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_seen_jobs() -> set:
-    """بارگذاری ID های قبلاً ارسال‌شده از فایل کش"""
-    if SEEN_JOBS_FILE.exists():
-        ids = set(line.strip() for line in SEEN_JOBS_FILE.read_text().splitlines() if line.strip())
-        log.info(f"Loaded {len(ids)} seen job IDs from cache")
-        return ids
-    log.info("No cache file found — starting fresh")
-    return set()
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+GSHEET_CREDENTIALS = os.environ.get("GSHEET_CREDENTIALS", "")
+GSHEET_ID = os.environ.get("GSHEET_ID", "")
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() in {"1", "true", "yes"}
 
 
-def save_seen_jobs(seen: set) -> None:
-    """ذخیره ID ها — با محدودیت MAX_SEEN_JOBS برای جلوگیری از بزرگ شدن فایل"""
-    ids_list = list(seen)
-    if len(ids_list) > MAX_SEEN_JOBS:
-        ids_list = ids_list[-MAX_SEEN_JOBS:]   # فقط جدیدترین‌ها نگه داشته میشه
-    SEEN_JOBS_FILE.write_text("\n".join(ids_list))
-    log.info(f"Saved {len(ids_list)} job IDs to cache")
+def load_seen_jobs():
+    if not SEEN_JOBS_FILE.exists():
+        return set()
+    return {line.strip() for line in SEEN_JOBS_FILE.read_text().splitlines()
+            if line.strip()}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# JSearch API
-# ══════════════════════════════════════════════════════════════════════════════
+def save_seen_jobs(seen):
+    # Sorting makes the file deterministic; the newest IDs are not guaranteed
+    # to be last, but the size remains bounded.
+    ids = sorted(seen)[-MAX_SEEN_JOBS:]
+    SEEN_JOBS_FILE.write_text("\n".join(ids) + ("\n" if ids else ""))
 
-def search_jobs(query: str, retries: int = 3) -> list:
-    """جستجو با retry خودکار و مدیریت rate limit"""
+
+def search_jobs(query, retries=3):
     url = "https://jsearch.p.rapidapi.com/search"
-    headers = {
-        "x-rapidapi-key":  RAPIDAPI_KEY,
-        "x-rapidapi-host": "jsearch.p.rapidapi.com",
-    }
-    params = {
-        "query":          query,
-        "num_pages":      "1",
-        "date_posted":    "3days",
-        "work_from_home": "true",
-    }
+    headers = {"x-rapidapi-key": RAPIDAPI_KEY,
+               "x-rapidapi-host": "jsearch.p.rapidapi.com"}
+    params = {"query": query, "num_pages": "1", "date_posted": "3days",
+              "work_from_home": "true"}
 
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=20)
-
-            if resp.status_code == 429:
-                log.warning("Rate limit hit — waiting 60s before retry...")
-                time.sleep(60)
+            response = requests.get(url, headers=headers, params=params, timeout=20)
+            if response.status_code == 429:
+                wait = min(60 * attempt, 180)
+                log.warning("Rate limited; waiting %ss", wait)
+                time.sleep(wait)
                 continue
-
-            if resp.status_code == 403:
-                log.error("API key invalid or not subscribed (403)")
+            if response.status_code == 403:
+                log.error("RapidAPI key is invalid or not subscribed")
                 return []
-
-            resp.raise_for_status()
-            data = resp.json()
-
-            if data.get("status") != "OK":
-                log.warning(f"API non-OK for '{query}': {data.get('error')}")
-                return []
-
-            return data.get("data", [])
-
-        except requests.exceptions.Timeout:
-            log.warning(f"Timeout on attempt {attempt}/{retries} for '{query}'")
-        except requests.exceptions.JSONDecodeError:
-            log.error(f"Invalid JSON response for '{query}'")
-            return []
-        except requests.exceptions.RequestException as e:
-            log.error(f"Request error (attempt {attempt}/{retries}): {e}")
-
-        if attempt < retries:
-            wait = 5 * attempt
-            log.info(f"Waiting {wait}s before retry...")
-            time.sleep(wait)
-
-    log.error(f"All {retries} attempts failed for '{query}'")
+            response.raise_for_status()
+            data = response.json()
+            return data.get("data", []) if data.get("status") == "OK" else []
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("Search attempt %s/%s failed: %s", attempt, retries, exc)
+            if attempt < retries:
+                time.sleep(5 * attempt)
     return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# فیلتر Blacklist
-# ══════════════════════════════════════════════════════════════════════════════
-
-def is_blacklisted(job: dict) -> bool:
-    description = (job.get("job_description") or "").lower()
-    title       = (job.get("job_title") or "").lower()
-    combined    = f"{title} {description}"
-
-    for keyword in BLACKLIST_KEYWORDS:
-        if keyword.lower() in combined:
-            log.info(f"  ⛔ Blacklisted '{job.get('job_title')}' — matched: '{keyword}'")
-            return True
-    return False
+def job_id(job):
+    return job.get("job_id") or job.get("job_apply_link") or job.get("job_google_link")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Telegram
-# ══════════════════════════════════════════════════════════════════════════════
-
-def send_telegram(text: str) -> bool:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id":                  TELEGRAM_CHAT_ID,
-        "text":                     text,
-        "parse_mode":               "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=15)
-        if not resp.ok:
-            log.error(f"Telegram error {resp.status_code}: {resp.text[:300]}")
-            return False
-        return True
-    except Exception as e:
-        log.error(f"Telegram send exception: {e}")
-        return False
+def job_text(job):
+    return " ".join(str(job.get(field) or "") for field in (
+        "job_title", "job_description", "job_employment_type",
+        "job_required_skills", "job_city", "job_country")).lower()
 
 
-def extract_salary(job: dict) -> str:
-    """استخراج حقوق از فیلدهای مختلف API"""
-    # اول فیلد آماده رو چک میکنیم
+def has_any(text, terms):
+    return [term for term in terms if term.lower() in text]
+
+
+def analyze_job(job):
+    text = job_text(job)
+    matched_skills = [skill for skill in TARGET_SKILLS if skill.lower() in text]
+    preferred = has_any(text, PREFERRED_TERMS)
+    restrictions = has_any(text, HARD_RESTRICTIONS)
+    review_terms = has_any(text, ELIGIBILITY_REVIEW_TERMS)
+    score = sum(TARGET_SKILLS[skill] for skill in matched_skills)
+    score += 3 * len(preferred)
+    score -= 20 * len(restrictions)
+    return score, matched_skills, preferred, restrictions, review_terms
+
+
+def extract_salary(job):
     if job.get("job_salary_string"):
-        return job["job_salary_string"]
-
-    # بعد min/max رو بررسی میکنیم
-    min_s  = job.get("job_min_salary")
-    max_s  = job.get("job_max_salary")
+        return str(job["job_salary_string"])
+    minimum, maximum = job.get("job_min_salary"), job.get("job_max_salary")
     period = (job.get("job_salary_period") or "").lower()
-
-    period_map = {"year": "/yr", "month": "/mo", "hour": "/hr", "week": "/wk"}
-    period_label = period_map.get(period, f"/{period}" if period else "")
-
-    if min_s and max_s:
-        return f"${int(min_s):,} – ${int(max_s):,}{period_label}"
-    if min_s:
-        return f"${int(min_s):,}+{period_label}"
+    suffix = {"year": "/yr", "month": "/mo", "hour": "/hr", "week": "/wk"}.get(period, "")
+    try:
+        if minimum and maximum:
+            return f"${int(minimum):,} – ${int(maximum):,}{suffix}"
+        if minimum:
+            return f"${int(minimum):,}+{suffix}"
+    except (TypeError, ValueError):
+        pass
     return ""
 
 
-def format_job(job: dict) -> str:
-    """ساخت متن پیام تلگرام با html.escape روی تمام متن‌ها"""
-    title    = html.escape(job.get("job_title")    or "بدون عنوان")
-    company  = html.escape(job.get("employer_name") or "نامشخص")
-    city     = html.escape(job.get("job_city")     or "")
-    country  = html.escape(job.get("job_country")  or "")
-    location = f"{city}, {country}".strip(", ") or "Remote"
-    source   = html.escape(job.get("job_publisher") or "")
-    link     = job.get("job_apply_link") or job.get("job_google_link") or ""
-    salary   = extract_salary(job)
-
-    lines = [
-        f"💼 <b>{title}</b>",
-        f"🏢 {company}",
-        f"📍 {location}",
-    ]
-
-    if salary:
-        lines.append(f"💰 <b>{html.escape(salary)}</b>")   # برجسته و مجزا
-
-    if source:
-        lines.append(f"🌐 {source}")
-
+def format_job(job):
+    score, skills, preferred, restrictions, review_terms = analyze_job(job)
+    title = html.escape(job.get("job_title") or "Untitled")
+    company = html.escape(job.get("employer_name") or "Unknown")
+    location = html.escape(
+        ", ".join(x for x in (job.get("job_city"), job.get("job_country")) if x)
+        or "Remote")
+    link = job.get("job_apply_link") or job.get("job_google_link") or ""
+    link = html.escape(str(link), quote=True)
+    lines = [f"💼 <b>{title}</b>", f"🏢 {company}", f"📍 {location}",
+             f"🎯 Match: <b>{score}</b> ({', '.join(skills) or 'none'})"]
+    if extract_salary(job):
+        lines.append(f"💰 <b>{html.escape(extract_salary(job))}</b>")
+    if preferred:
+        lines.append("🌍 International-friendly terms found")
+    if restrictions:
+        lines.append("⛔ Location restriction found")
+    if review_terms:
+        lines.append("⚠️ Review Iran/payment eligibility manually")
     if link:
-        lines.append(f'🔗 <a href="{link}">Apply Now</a>')
-
+        lines.append(f'<a href="{link}">Apply Now</a>')
     return "\n".join(lines)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Google Sheets (اختیاری)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_sheets_client():
-    if not SHEETS_AVAILABLE:
-        log.info("gspread not installed — skipping Google Sheets")
-        return None
-    if not GSHEET_CREDENTIALS or not GSHEET_ID:
-        log.info("GSHEET_CREDENTIALS or GSHEET_ID not set — skipping Google Sheets")
-        return None
-    try:
-        creds_dict = json.loads(GSHEET_CREDENTIALS)
-        scopes     = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds  = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        log.info("Google Sheets connected ✅")
-        return client
-    except json.JSONDecodeError:
-        log.error("GSHEET_CREDENTIALS is not valid JSON")
-    except Exception as e:
-        log.error(f"Google Sheets auth error: {e}")
-    return None
+def send_telegram(text):
+    if TEST_MODE:
+        print("\n" + "-" * 70 + "\n" + text)
+        return True
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Telegram environment variables are missing")
+    response = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+              "parse_mode": "HTML", "disable_web_page_preview": True},
+        timeout=15)
+    response.raise_for_status()
+    return True
 
 
-def ensure_sheet_headers(client) -> None:
-    if client is None:
+def append_to_sheet(job):
+    if TEST_MODE or not SHEETS_AVAILABLE or not GSHEET_CREDENTIALS or not GSHEET_ID:
         return
     try:
-        sheet = client.open_by_key(GSHEET_ID).worksheet(GSHEET_SHEET_NAME)
-        first_row = sheet.row_values(1)
-        if not first_row:
-            headers = ["Job Title", "Company", "Apply Link", "Posted Date",
-                       "City", "Country", "Salary", "Saved At (UTC)"]
-            sheet.insert_row(headers, 1)
-            log.info("Sheet headers created")
-    except Exception as e:
-        log.error(f"Sheet header check error: {e}")
-
-
-def append_to_sheet(client, job: dict) -> None:
-    if client is None:
-        return
-    try:
-        sheet = client.open_by_key(GSHEET_ID).worksheet(GSHEET_SHEET_NAME)
-        posted = (job.get("job_posted_at_datetime_utc") or "")[:10]
-        row = [
-            job.get("job_title", ""),
-            job.get("employer_name", ""),
+        credentials = Credentials.from_service_account_info(
+            json.loads(GSHEET_CREDENTIALS),
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"])
+        sheet = gspread.authorize(credentials).open_by_key(GSHEET_ID).worksheet(GSHEET_SHEET_NAME)
+        sheet.append_row([
+            job.get("job_title", ""), job.get("employer_name", ""),
             job.get("job_apply_link") or job.get("job_google_link") or "",
-            posted,
-            job.get("job_city", ""),
-            job.get("job_country", ""),
-            extract_salary(job),
-            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-        ]
-        sheet.append_row(row, value_input_option="USER_ENTERED")
-    except Exception as e:
-        log.error(f"Sheet append error: {e}")
+            (job.get("job_posted_at_datetime_utc") or "")[:10],
+            job.get("job_city", ""), job.get("job_country", ""),
+            extract_salary(job), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        ], value_input_option="USER_ENTERED")
+    except Exception as exc:
+        log.error("Google Sheets append failed: %s", exc)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Main
-# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    log.info(f"═══ Bot started at {now} ═══")
-
-    seen_jobs     = load_seen_jobs()
-    sheets_client = get_sheets_client()
-    ensure_sheet_headers(sheets_client)
-
-    new_jobs      = []
-    blacklisted   = 0
-    already_seen  = 0
-    errors        = 0
+    if not RAPIDAPI_KEY:
+        raise RuntimeError("RAPIDAPI_KEY is missing")
+    seen = set() if TEST_MODE else load_seen_jobs()
+    candidates, found_ids = {}, set()
 
     for query in SEARCH_QUERIES:
-        log.info(f"Searching: '{query}'")
-        try:
-            jobs = search_jobs(query)
-            log.info(f"  → {len(jobs)} raw results")
+        log.info("Searching: %s", query)
+        for job in search_jobs(query):
+            jid = job_id(job)
+            if not jid or jid in seen or jid in found_ids:
+                continue
+            found_ids.add(jid)
+            score, _, _, restrictions, _ = analyze_job(job)
+            if not restrictions and score >= MIN_MATCH_SCORE:
+                candidates[jid] = job
+        time.sleep(1.5)
 
-            for job in jobs:
-                try:
-                    job_id = job.get("job_id") or job.get("job_apply_link") or ""
-                    if not job_id:
-                        continue
+    ranked = sorted(candidates.values(),
+                    key=lambda item: analyze_job(item)[0], reverse=True)
+    log.info("Found %s matching jobs", len(ranked))
 
-                    if job_id in seen_jobs:
-                        already_seen += 1
-                        continue
+    if not ranked:
+        send_telegram("🔍 <b>Daily report</b>\nNo matching jobs found.")
+    else:
+        for job in ranked[:MAX_JOBS_PER_RUN]:
+            send_telegram(format_job(job))
+            if not TEST_MODE:
+                seen.add(job_id(job))  # Mark seen only after successful delivery.
+                append_to_sheet(job)
+            time.sleep(0.8)
 
-                    seen_jobs.add(job_id)   # همیشه ثبت میکنیم، حتی blacklisted ها
-
-                    if is_blacklisted(job):
-                        blacklisted += 1
-                        continue
-
-                    new_jobs.append(job)
-
-                except Exception as e:
-                    log.error(f"  Error processing job item: {e}")
-                    errors += 1
-                    continue
-
-        except Exception as e:
-            log.error(f"Error in query '{query}': {e}")
-            errors += 1
-            continue
-
-        time.sleep(1.5)   # احترام به rate limit
-
-    # حذف تکراری‌ها (یه آگهی ممکنه در چند query باشه)
-    dedup_seen = set()
-    unique_jobs = []
-    for job in new_jobs:
-        jid = job.get("job_id", "")
-        if jid and jid not in dedup_seen:
-            dedup_seen.add(jid)
-            unique_jobs.append(job)
-
-    log.info(f"Summary → new: {len(unique_jobs)} | blacklisted: {blacklisted} | already seen: {already_seen} | errors: {errors}")
-
-    # ─── ارسال به تلگرام ───────────────────────────────────────────────────
-    if not unique_jobs:
-        send_telegram(
-            f"🔍 <b>گزارش روزانه</b>\n"
-            f"📅 {now}\n\n"
-            f"✅ آگهی جدیدی امروز پیدا نشد.\n"
-            f"⛔ فیلتر شده: {blacklisted} | 🔁 تکراری: {already_seen}"
-        )
-        save_seen_jobs(seen_jobs)
-        return
-
-    # پیام هدر
-    send_telegram(
-        f"🔍 <b>آگهی‌های شغلی جدید</b>\n"
-        f"📅 {now}\n"
-        f"📊 {len(unique_jobs)} آگهی جدید | ⛔ {blacklisted} فیلتر شد\n"
-        f"➖➖➖➖➖➖➖➖"
-    )
-    time.sleep(1)
-
-    sent = 0
-    for job in unique_jobs[:MAX_JOBS_PER_RUN]:
-        try:
-            msg = format_job(job)
-            if send_telegram(msg):
-                sent += 1
-                append_to_sheet(sheets_client, job)
-            time.sleep(0.8)   # جلوگیری از flood limit تلگرام
-        except Exception as e:
-            log.error(f"Error sending job to Telegram: {e}")
-            continue
-
-    save_seen_jobs(seen_jobs)
-    log.info(f"═══ Done. Sent {sent}/{len(unique_jobs)} jobs ═══")
+    if not TEST_MODE:
+        save_seen_jobs(seen)
 
 
 if __name__ == "__main__":
