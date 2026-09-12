@@ -38,7 +38,8 @@ MAX_JOBS_PER_RUN  = 15
 # ─── Search Queries ───────────────────────────────────────────────────────────
 # Removed "worldwide" to broaden the net, relying on Python to filter the bad ones out.
 SEARCH_QUERIES = [
-   "fullstack developer"
+   "fullstack developer",
+"software engineer","ai product developer"
 ]
 
 # ─── Strict Filters ───────────────────────────────────────────────────────────
